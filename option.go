@@ -29,7 +29,7 @@ func WithParser(p ScheduleParser) Option {
 	}
 }
 
-// WithChain specifies Job wrappers to apply to all jobs added to this cron.
+// WithChain specifies JobExt wrappers to apply to all jobs added to this cron.
 // Refer to the Chain* functions in this package for provided wrappers.
 func WithChain(wrappers ...JobWrapper) Option {
 	return func(c *Cron) {

@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ type Cron struct {
 	parser    ScheduleParser
 	nextID    EntryID
 	jobWaiter sync.WaitGroup
+	storage   FireStorage
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -31,9 +33,20 @@ type ScheduleParser interface {
 	Parse(spec string) (Schedule, error)
 }
 
-// Job is an interface for submitted cron jobs.
-type Job interface {
-	Run()
+// JobExt is an interface for submitted cron jobs.
+type JobExt interface {
+	Run(ext ExtContext)
+}
+
+type JobFunc func(extContext ExtContext)
+
+func (j JobFunc) Run(extContext ExtContext) {
+	j(extContext)
+}
+
+type ExtContext struct {
+	IsMisFire   bool
+	IsInterrupt bool
 }
 
 // Schedule describes a job's duty cycle.
@@ -63,12 +76,18 @@ type Entry struct {
 	Prev time.Time
 
 	// WrappedJob is the thing to run when the Schedule is activated.
-	WrappedJob Job
+	WrappedJob JobExt
 
 	// Job is the thing that was submitted to cron.
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
-	Job Job
+	Job JobExt
+
+	MisFireThreadHold time.Duration
+
+	InterruptRetry bool
+
+	TaskId string
 }
 
 // Valid returns true if this is not the zero entry.
@@ -130,22 +149,17 @@ func New(opts ...Option) *Cron {
 	return c
 }
 
-// FuncJob is a wrapper that turns a func() into a cron.Job
-type FuncJob func()
-
-func (f FuncJob) Run() { f() }
-
 // AddFunc adds a func to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(spec string, cmd func(extContext ExtContext)) (EntryID, error) {
+	return c.AddJob(spec, JobFunc(cmd))
 }
 
-// AddJob adds a Job to the Cron to be run on the given schedule.
+// AddJob adds a JobExt to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+func (c *Cron) AddJob(spec string, cmd JobExt) (EntryID, error) {
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
 		return 0, err
@@ -153,9 +167,37 @@ func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
 	return c.Schedule(schedule, cmd), nil
 }
 
-// Schedule adds a Job to the Cron to be run on the given schedule.
+func (c *Cron) AddTask(spec string, taskId string, cmd JobExt, misFireThreadHold time.Duration) (EntryID, error) {
+	schedule, err := c.parser.Parse(spec)
+	if err != nil {
+		return 0, err
+	}
+	return c.ScheduleWithTaskId(schedule, cmd, taskId, misFireThreadHold), nil
+}
+
+func (c *Cron) ScheduleWithTaskId(schedule Schedule, cmd JobExt, taskId string, misFireThreadHold time.Duration) EntryID {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	c.nextID++
+	entry := &Entry{
+		ID:                c.nextID,
+		Schedule:          schedule,
+		WrappedJob:        c.chain.Then(cmd),
+		Job:               cmd,
+		TaskId:            taskId,
+		MisFireThreadHold: misFireThreadHold * time.Second,
+	}
+	if !c.running {
+		c.entries = append(c.entries, entry)
+	} else {
+		c.add <- entry
+	}
+	return entry.ID
+}
+
+// Schedule adds a JobExt to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+func (c *Cron) Schedule(schedule Schedule, cmd JobExt) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
@@ -222,6 +264,10 @@ func (c *Cron) Start() {
 	go c.run()
 }
 
+func (c *Cron) SetStorage(s FireStorage) {
+	c.storage = s
+}
+
 // Run the cron scheduler, or no-op if already running.
 func (c *Cron) Run() {
 	c.runningMu.Lock()
@@ -242,6 +288,25 @@ func (c *Cron) run() {
 	// Figure out the next activation times for each entry.
 	now := c.now()
 	for _, entry := range c.entries {
+		if e := c.storage.GetEntry(entry.TaskId); e != nil && e.Next.Before(now) &&
+			entry.MisFireThreadHold != 0 && now.Sub(e.Next) < (entry.MisFireThreadHold) {
+			log.Println("======misfire task join==========")
+			c.startJob(entry, ExtContext{
+				IsMisFire:   true,
+				IsInterrupt: false,
+			})
+		}
+		entry.InterruptRetry = true
+		if entry.InterruptRetry {
+			for _, taskId := range c.storage.GetRetryEntryList() {
+				if taskId == entry.TaskId {
+					c.startJob(entry, ExtContext{
+						IsMisFire:   false,
+						IsInterrupt: true,
+					})
+				}
+			}
+		}
 		entry.Next = entry.Schedule.Next(now)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
@@ -270,9 +335,10 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+					c.startJob(e, ExtContext{})
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
+					c.storage.PutEntry(e.TaskId, e.Next)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
@@ -305,11 +371,13 @@ func (c *Cron) run() {
 }
 
 // startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
+func (c *Cron) startJob(e *Entry, ext ExtContext) {
 	c.jobWaiter.Add(1)
 	go func() {
 		defer c.jobWaiter.Done()
-		j.Run()
+		c.storage.PutRetryEntry(e.TaskId)
+		e.Job.Run(ext)
+		c.storage.DelRetryEntry(e.TaskId)
 	}()
 }
 
